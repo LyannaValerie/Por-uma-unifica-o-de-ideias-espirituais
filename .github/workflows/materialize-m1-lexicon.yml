@@ -1,0 +1,259 @@
+name: Materialize M1.1 lexical controls
+
+on:
+  push:
+    paths:
+      - '.github/workflows/materialize-m1-lexicon.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF text extractor
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils
+
+      - name: Download frozen public sources
+        run: |
+          set -euxo pipefail
+          curl --fail --location --retry 3 \
+            'https://repositorio.pucrs.br/dspace/bitstream/10923/9063/2/Normas_brasileiras_para_o_Affective_Norms_for_English_Words.pdf' \
+            -o anew_br_primary.pdf
+          curl --fail --location --retry 3 \
+            'https://www.lexicodoportugues.com/downloads/lexporbr_alfa_txt.txt' \
+            -o lexporbr_alfa_txt.txt
+          sha256sum anew_br_primary.pdf lexporbr_alfa_txt.txt | tee source_sha256.txt
+          pdftotext -raw anew_br_primary.pdf anew_br_primary.txt
+
+      - name: Apply frozen ANEW-Br × LexPorBR-main matching
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv, math, re, sys, unicodedata
+          from collections import defaultdict
+          from pathlib import Path
+
+          CAP_V = 0.75
+          CAP_A = 0.75
+          CAP_Z = 0.10
+
+          TARGETS = {
+              'AZUL':     {'v': 7.42, 'a': 3.37, 'length': 4},
+              'VERDE':    {'v': 7.39, 'a': 3.26, 'length': 5},
+              'AMARELO':  {'v': 6.76, 'a': 3.11, 'length': 7},
+              'VERMELHO': {'v': 5.84, 'a': 4.94, 'length': 8},
+          }
+
+          COLOR_TERMS = {
+              'AZUL','VERDE','AMARELO','VERMELHO','BRANCO','BRANCA','PRETO','PRETA',
+              'ROSA','ROXO','ROXA','VIOLETA','LARANJA','CINZA','MARROM','BEGE','DOURADO',
+              'DOURADA','PRATEADO','PRATEADA','ESCARLATE','CARMESIM','TURQUESA','ANIL'
+          }
+
+          def nfc(s):
+              return unicodedata.normalize('NFC', s.strip())
+
+          def num(s):
+              return float(s.replace(',', '.'))
+
+          # ---- Parse primary ANEW-Br appendix ----
+          raw = Path('anew_br_primary.txt').read_text(encoding='utf-8', errors='replace')
+          # Each appendix row is WORD  val_mean val_sd arousal_mean arousal_sd.
+          # The regex is intentionally restricted to uppercase word labels + four x,xx numbers.
+          pat = re.compile(
+              r'(?<!\S)([A-ZÁÀÂÃÉÊÍÓÔÕÚÜÇ][A-ZÁÀÂÃÉÊÍÓÔÕÚÜÇ\- ]{0,48}?)\s+'
+              r'([0-9],[0-9]{2})\s+([0-9],[0-9]{2})\s+([0-9],[0-9]{2})\s+([0-9],[0-9]{2})(?=\s|$)'
+          )
+          anew_rows = defaultdict(list)
+          for m in pat.finditer(raw):
+              w = nfc(' '.join(m.group(1).split()))
+              # Exclude obvious table-header captures if any.
+              if w in {'VALÊNCIA ALERTA', 'PALAVRA MÉDIA DP MÉDIA DP'}:
+                  continue
+              anew_rows[w].append((num(m.group(2)), num(m.group(4))))
+
+          # Collapse identical duplicate extractions; conflicting primary values are fatal.
+          anew = {}
+          for w, vals in anew_rows.items():
+              uniq = sorted(set(vals))
+              if len(uniq) == 1:
+                  anew[w] = uniq[0]
+              elif len(uniq) > 1:
+                  print(f'ANEW_CONFLICT {w}: {uniq}', file=sys.stderr)
+
+          print(f'ANEW parsed unique rows: {len(anew)}')
+          if len(anew) < 900:
+              raise SystemExit('ANEW_PARSE_FAILED: fewer than 900 unique appendix rows')
+
+          for c, t in TARGETS.items():
+              got = anew.get(c)
+              if got is None:
+                  raise SystemExit(f'ANEW_TARGET_MISSING: {c}')
+              if abs(got[0]-t['v']) > 0.005 or abs(got[1]-t['a']) > 0.005:
+                  raise SystemExit(f'ANEW_TARGET_MISMATCH {c}: got={got}, expected={(t["v"],t["a"])}')
+
+          # Mechanical affective/length/letters gates. Proper-name and color-semantic review are reported separately.
+          affect_pool = {}
+          for c, t in TARGETS.items():
+              arr = []
+              for w, (v,a) in anew.items():
+                  if len(w) != t['length']:
+                      continue
+                  if not w or not all(ch.isalpha() for ch in w):
+                      continue
+                  dv, da = abs(v-t['v']), abs(a-t['a'])
+                  if dv <= CAP_V + 1e-12 and da <= CAP_A + 1e-12:
+                      arr.append((w,v,a,dv,da))
+              affect_pool[c] = arr
+              print(f'{c}: affective+length pool={len(arr)}')
+
+          needed = {c for c in TARGETS}
+          for arr in affect_pool.values():
+              needed.update(w for w, *_ in arr)
+
+          # ---- Parse LexPorBR MAIN word-form corpus ----
+          p = Path('lexporbr_alfa_txt.txt')
+          data = p.read_bytes()
+          # Official Alfa text is commonly distributed in Latin-1; prefer strict UTF-8 if possible.
+          try:
+              txt = data.decode('utf-8')
+              lex_encoding = 'utf-8'
+          except UnicodeDecodeError:
+              txt = data.decode('latin-1')
+              lex_encoding = 'latin-1'
+          lines = txt.splitlines()
+          if not lines:
+              raise SystemExit('LEXPORBR_EMPTY')
+          header = [nfc(x).lower() for x in lines[0].split('\t')]
+          print('LexPorBR encoding:', lex_encoding)
+          print('LexPorBR header:', header)
+
+          def find_col(*names):
+              for name in names:
+                  name = name.lower()
+                  if name in header:
+                      return header.index(name)
+              raise SystemExit(f'LEXPORBR_HEADER_MISSING: {names}; header={header}')
+
+          i_word = find_col('ortografia')
+          i_freq = find_col('freq_orto')
+          i_fpm  = find_col('freq_orto/m', 'freq_orto_m', 'freq_orto/milhão')
+          i_zipf = find_col('zipf_escala', 'zipf')
+          i_len  = find_col('nb_letras', 'n_letras')
+
+          lex_rows = defaultdict(list)
+          for line in lines[1:]:
+              cols = line.split('\t')
+              if len(cols) <= max(i_word,i_freq,i_fpm,i_zipf,i_len):
+                  continue
+              w = nfc(cols[i_word]).upper()
+              if w not in needed:
+                  continue
+              try:
+                  rec = (
+                      int(float(cols[i_freq].replace(',','.'))),
+                      num(cols[i_fpm]),
+                      num(cols[i_zipf]),
+                      int(float(cols[i_len].replace(',','.'))),
+                  )
+              except Exception:
+                  continue
+              lex_rows[w].append(rec)
+
+          lex = {}
+          ambiguous = {}
+          for w, rows in lex_rows.items():
+              uniq = sorted(set(rows))
+              if len(uniq) == 1:
+                  lex[w] = uniq[0]
+              elif len(uniq) > 1:
+                  ambiguous[w] = uniq
+
+          # target form frequencies are required.
+          for c in TARGETS:
+              if c in ambiguous:
+                  raise SystemExit(f'WORD_FORM_FREQUENCY_AMBIGUITY_TARGET {c}: {ambiguous[c]}')
+              if c not in lex:
+                  raise SystemExit(f'LEXPORBR_TARGET_MISSING {c}')
+
+          out_rows = []
+          summary = []
+          for c, t in TARGETS.items():
+              cfreq, cfpm, czipf, clen = lex[c]
+              candidates = []
+              for w,v,a,dv,da in affect_pool[c]:
+                  if w == c:
+                      # keep self out; exact treatment word is COLOR_TERM by definition.
+                      continue
+                  if w in ambiguous or w not in lex:
+                      continue
+                  freq,fpm,zipf,nletters = lex[w]
+                  if nletters != t['length']:
+                      continue
+                  dz = abs(zipf-czipf)
+                  if dz > CAP_Z + 1e-12:
+                      continue
+                  nV,nA,nZ = dv/CAP_V, da/CAP_A, dz/CAP_Z
+                  worst=max(nV,nA,nZ)
+                  total=nV+nA+nZ
+                  automatic_color_term = w in COLOR_TERMS
+                  candidates.append({
+                      'color':c,'word':w,
+                      'color_v':t['v'],'color_a':t['a'],
+                      'v':v,'a':a,'dV':dv,'dA':da,
+                      'color_freq':cfreq,'color_fpm':cfpm,'color_zipf':czipf,
+                      'freq':freq,'fpm':fpm,'zipf':zipf,'dZ':dz,
+                      'worst':worst,'total':total,
+                      'automatic_color_term':automatic_color_term,
+                  })
+              candidates.sort(key=lambda r:(r['worst'],r['total'],r['dZ'],r['dV'],r['dA'],r['word']))
+              if not candidates:
+                  summary.append(f'## {c}\n\nLEXICON_MATCH_FAILED: no candidate passed mechanical gates.\n')
+              else:
+                  summary.append(f'## {c}\n')
+                  summary.append(f'Color form: freq={cfreq}, freq/M={cfpm:.4f}, Zipf={czipf:.4f}, V={t["v"]:.2f}, A={t["a"]:.2f}\n')
+                  summary.append('|rank|candidate|freq|freq/M|Zipf|dZ|V|A|dV|dA|worst|total|auto color-term|')
+                  summary.append('|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|')
+                  for rank,r in enumerate(candidates,1):
+                      r['rank']=rank
+                      out_rows.append(r)
+                      if rank <= 25:
+                          summary.append(
+                              f"|{rank}|{r['word']}|{r['freq']}|{r['fpm']:.4f}|{r['zipf']:.4f}|{r['dZ']:.4f}|"
+                              f"{r['v']:.2f}|{r['a']:.2f}|{r['dV']:.2f}|{r['dA']:.2f}|{r['worst']:.4f}|{r['total']:.4f}|{r['automatic_color_term']}|"
+                          )
+                  summary.append('')
+
+          fields = ['color','rank','word','color_freq','color_fpm','color_zipf','freq','fpm','zipf','dZ',
+                    'color_v','color_a','v','a','dV','dA','worst','total','automatic_color_term']
+          with open('materialization_candidates.csv','w',newline='',encoding='utf-8') as f:
+              wr=csv.DictWriter(f,fieldnames=fields)
+              wr.writeheader()
+              for r in out_rows:
+                  wr.writerow({k:r[k] for k in fields})
+
+          Path('materialization_summary.md').write_text('\n'.join(summary)+'\n',encoding='utf-8')
+          print('\n'.join(summary))
+          PY
+
+      - name: Hash outputs
+        run: sha256sum materialization_candidates.csv materialization_summary.md | tee output_sha256.txt
+
+      - name: Upload materialization evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: m1-lexical-materialization
+          path: |
+            source_sha256.txt
+            output_sha256.txt
+            materialization_candidates.csv
+            materialization_summary.md
+          if-no-files-found: error
