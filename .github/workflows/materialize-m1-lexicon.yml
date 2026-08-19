@@ -19,21 +19,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install PDF text extractor
+      - name: Install source extractors
         run: |
           sudo apt-get update
-          sudo apt-get install -y poppler-utils
+          sudo apt-get install -y poppler-utils unzip
 
       - name: Download frozen public sources
         run: |
           set -euxo pipefail
-          curl --fail --location --retry 3 \
-            'https://repositorio.pucrs.br/dspace/bitstream/10923/9063/2/Normas_brasileiras_para_o_Affective_Norms_for_English_Words.pdf' \
+          curl --fail --location --retry 3 --user-agent 'Mozilla/5.0' \
+            'https://trends.org.br/article/10.1590/S2237-60892011000300003/pdf/trends-33-3-135.pdf' \
             -o anew_br_primary.pdf
-          curl --fail --location --retry 3 \
-            'https://www.lexicodoportugues.com/downloads/lexporbr_alfa_txt.txt' \
-            -o lexporbr_alfa_txt.txt
-          sha256sum anew_br_primary.pdf lexporbr_alfa_txt.txt | tee source_sha256.txt
+          curl --fail --location --retry 3 --user-agent 'Mozilla/5.0' \
+            'https://journals.plos.org/plosone/article/file?id=10.1371%2Fjournal.pone.0144016.s004&type=supplementary' \
+            -o lexporbr_s1.zip
+          unzip -t lexporbr_s1.zip
+          rm -rf lexporbr_s1
+          mkdir -p lexporbr_s1
+          unzip -q lexporbr_s1.zip -d lexporbr_s1
+          LEX_FILE="$(find lexporbr_s1 -type f -iname '*.txt' -print -quit)"
+          test -n "$LEX_FILE"
+          cp "$LEX_FILE" lexporbr_alfa_txt.txt
+          sha256sum anew_br_primary.pdf lexporbr_s1.zip lexporbr_alfa_txt.txt | tee source_sha256.txt
           pdftotext -raw anew_br_primary.pdf anew_br_primary.txt
 
       - name: Apply frozen ANEW-Br × LexPorBR-main matching
